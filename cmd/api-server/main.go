@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand"
 	"mini-k8s/pkg/models"
@@ -25,6 +26,8 @@ var clusterState = struct {
 	Services:    make(map[string]*models.Service),
 }
 
+var subscribers = make([]chan models.Event, 0)
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
@@ -40,11 +43,67 @@ func main() {
 	mux.HandleFunc("/deployments", deploymentsHandler)
 	mux.HandleFunc("/deployments/", deploymentHandler)
 	mux.HandleFunc("/services", servicesHandler)
+	mux.HandleFunc("/watch", watchHandler)
 
 	go controllerLoop()
 
 	log.Println("API Server running on :8080")
 	http.ListenAndServe(":8080", mux)
+}
+
+func removeSubscriber(target chan models.Event) {
+	for i, sub := range subscribers {
+		if sub == target {
+			subscribers = append(subscribers[:i], subscribers[i+1:]...)
+			break
+		}
+	}
+}
+
+func broadcast(event models.Event) {
+	for _, sub := range subscribers {
+		select {
+		case sub <- event:
+		default:
+			// skip slow subscriber
+		}
+	}
+}
+
+func watchHandler(w http.ResponseWriter, r *http.Request) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	ch := make(chan models.Event, 10)
+
+	// register subscriber
+	subscribers = append(subscribers, ch)
+
+	log.Println("New watcher connected")
+
+	// detect disconnect
+	notify := r.Context().Done()
+
+	for {
+		select {
+		case event := <-ch:
+			data, _ := json.Marshal(event)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+
+		case <-notify:
+			log.Println("Watcher disconnected")
+			removeSubscriber(ch)
+			return
+		}
+	}
 }
 
 func servicesHandler(w http.ResponseWriter, r *http.Request) {
@@ -62,6 +121,12 @@ func servicesHandler(w http.ResponseWriter, r *http.Request) {
 		clusterState.Services[s.ID] = &s
 
 		log.Printf("[API] Service created: %s\n", s.Name)
+
+		broadcast(models.Event{
+			Type: "ADDED",
+			Kind: "SERVICE",
+			Data: s,
+		})
 
 		json.NewEncoder(w).Encode(s)
 
@@ -88,6 +153,13 @@ func podsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		clusterState.Pods[pod.ID] = &pod
+
+		broadcast(models.Event{
+			Type: "ADDED",
+			Kind: "POD",
+			Data: pod,
+		})
+
 		json.NewEncoder(w).Encode(pod)
 
 	case http.MethodGet:
@@ -110,6 +182,11 @@ func podHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(pod)
 
 	case http.MethodDelete:
+		broadcast(models.Event{
+			Type: "DELETED",
+			Kind: "POD",
+			Data: pod,
+		})
 		delete(clusterState.Pods, id)
 
 	case http.MethodPut:
@@ -120,6 +197,12 @@ func podHandler(w http.ResponseWriter, r *http.Request) {
 		pod.ContainerID = updated.ContainerID
 		pod.RetryCount = updated.RetryCount
 		pod.Port = updated.Port
+
+		broadcast(models.Event{
+			Type: "UPDATED",
+			Kind: "POD",
+			Data: pod,
+		})
 	}
 }
 
@@ -223,6 +306,11 @@ func controllerLoop() {
 					}
 
 					clusterState.Pods[pod.ID] = pod
+					broadcast(models.Event{
+						Type: "ADDED",
+						Kind: "POD",
+						Data: pod,
+					})
 					log.Printf("[ReplicaController] Created pod %s for deployment %s\n", pod.ID, d.ID)
 				}
 			}
@@ -244,6 +332,11 @@ func controllerLoop() {
 						delete(clusterState.Pods, id)
 						toDelete--
 
+						broadcast(models.Event{
+							Type: "DELETED",
+							Kind: "POD",
+							Data: pod,
+						})
 						log.Printf("[ReplicaController] Deleted pod %s\n", id)
 					}
 				}

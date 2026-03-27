@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,8 +15,14 @@ import (
 
 const apiServer = "http://localhost:8080"
 
+var podCache = make(map[string]*models.Pod)
+var serviceCache = make(map[string]*models.Service)
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
+
+	initialSync()
+	go startWatcher()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/service/", serviceProxyHandler)
@@ -24,16 +31,95 @@ func main() {
 	http.ListenAndServe(":9090", mux)
 }
 
-func fetchServiceByName(name string) *models.Service {
-	resp, err := http.Get(apiServer + "/services")
+func startWatcher() {
+	for {
+		watchLoop()
+		log.Println("Reconnecting to watch...")
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func handleEvent(event models.Event) {
+
+	switch event.Kind {
+
+	case "POD":
+		pod := &models.Pod{}
+		convert(event.Data, pod)
+
+		if event.Type == "DELETED" {
+			delete(podCache, pod.ID)
+		} else {
+			podCache[pod.ID] = pod
+		}
+
+	case "SERVICE":
+		svc := &models.Service{}
+		convert(event.Data, svc)
+
+		if event.Type == "DELETED" {
+			delete(serviceCache, svc.ID)
+		} else {
+			serviceCache[svc.ID] = svc
+		}
+	}
+}
+
+func convert(input interface{}, output interface{}) {
+	b, _ := json.Marshal(input)
+	json.Unmarshal(b, output)
+}
+
+func watchLoop() {
+
+	resp, err := http.Get(apiServer + "/watch")
 	if err != nil {
-		return nil
+		log.Println("Watch connection failed")
+		return
 	}
 
+	reader := bufio.NewReader(resp.Body)
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			log.Println("Watch disconnected")
+			return
+		}
+
+		if strings.HasPrefix(line, "data: ") {
+			var event models.Event
+			json.Unmarshal([]byte(line[6:]), &event)
+
+			handleEvent(event)
+		}
+	}
+}
+
+func initialSync() {
+	// pods
+	resp, _ := http.Get(apiServer + "/pods")
+	var pods map[string]*models.Pod
+	json.NewDecoder(resp.Body).Decode(&pods)
+
+	for _, p := range pods {
+		podCache[p.ID] = p
+	}
+
+	// services
+	resp2, _ := http.Get(apiServer + "/services")
 	var services map[string]*models.Service
-	json.NewDecoder(resp.Body).Decode(&services)
+	json.NewDecoder(resp2.Body).Decode(&services)
 
 	for _, s := range services {
+		serviceCache[s.ID] = s
+	}
+
+	log.Println("Initial sync done")
+}
+
+func fetchServiceByName(name string) *models.Service {
+	for _, s := range serviceCache {
 		if s.Name == name {
 			return s
 		}
@@ -43,16 +129,9 @@ func fetchServiceByName(name string) *models.Service {
 }
 
 func fetchPods() []*models.Pod {
-	resp, err := http.Get(apiServer + "/pods")
-	if err != nil {
-		return nil
-	}
-
-	var podsMap map[string]*models.Pod
-	json.NewDecoder(resp.Body).Decode(&podsMap)
 
 	var pods []*models.Pod
-	for _, p := range podsMap {
+	for _, p := range podCache {
 		pods = append(pods, p)
 	}
 

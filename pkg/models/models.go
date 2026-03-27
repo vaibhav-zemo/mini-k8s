@@ -28,3 +28,9 @@ type Service struct {
 	DeploymentID string `json:"deploymentId"`
 	Port         int    `json:"port"`
 }
+
+type Event struct {
+	Type string      `json:"type"` // ADDED, UPDATED, DELETED
+	Kind string      `json:"kind"` // POD, SERVICE
+	Data interface{} `json:"data"`
+}

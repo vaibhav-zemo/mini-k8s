@@ -7,7 +7,9 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"mini-k8s/pkg/clients"
 	"mini-k8s/pkg/models"
+	"mini-k8s/pkg/utils"
 	"net/http"
 	"strings"
 	"time"
@@ -19,8 +21,6 @@ var podCache = make(map[string]*models.Pod)
 var serviceCache = make(map[string]*models.Service)
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	initialSync()
 	go startWatcher()
 
@@ -45,7 +45,7 @@ func handleEvent(event models.Event) {
 
 	case "POD":
 		pod := &models.Pod{}
-		convert(event.Data, pod)
+		utils.Convert(event.Data, pod)
 
 		if event.Type == "DELETED" {
 			delete(podCache, pod.ID)
@@ -55,7 +55,7 @@ func handleEvent(event models.Event) {
 
 	case "SERVICE":
 		svc := &models.Service{}
-		convert(event.Data, svc)
+		utils.Convert(event.Data, svc)
 
 		if event.Type == "DELETED" {
 			delete(serviceCache, svc.ID)
@@ -63,11 +63,6 @@ func handleEvent(event models.Event) {
 			serviceCache[svc.ID] = svc
 		}
 	}
-}
-
-func convert(input interface{}, output interface{}) {
-	b, _ := json.Marshal(input)
-	json.Unmarshal(b, output)
 }
 
 func watchLoop() {
@@ -98,19 +93,13 @@ func watchLoop() {
 
 func initialSync() {
 	// pods
-	resp, _ := http.Get(apiServer + "/pods")
-	var pods map[string]*models.Pod
-	json.NewDecoder(resp.Body).Decode(&pods)
-
+	pods := clients.GetPods()
 	for _, p := range pods {
 		podCache[p.ID] = p
 	}
 
 	// services
-	resp2, _ := http.Get(apiServer + "/services")
-	var services map[string]*models.Service
-	json.NewDecoder(resp2.Body).Decode(&services)
-
+	services := clients.GetServices()
 	for _, s := range services {
 		serviceCache[s.ID] = s
 	}
@@ -118,17 +107,7 @@ func initialSync() {
 	log.Println("Initial sync done")
 }
 
-func fetchServiceByName(name string) *models.Service {
-	for _, s := range serviceCache {
-		if s.Name == name {
-			return s
-		}
-	}
-
-	return nil
-}
-
-func fetchPods() []*models.Pod {
+func getPods() []*models.Pod {
 
 	var pods []*models.Pod
 	for _, p := range podCache {
@@ -174,13 +153,13 @@ func proxyToPod(w http.ResponseWriter, r *http.Request, pod *models.Pod) {
 func serviceProxyHandler(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/service/")
 
-	service := fetchServiceByName(name)
+	service := serviceCache[name]
 	if service == nil {
 		http.Error(w, "Service not found", 404)
 		return
 	}
 
-	pods := fetchPods()
+	pods := getPods()
 	runningPods := filterPods(service.DeploymentID, pods)
 
 	if len(runningPods) == 0 {

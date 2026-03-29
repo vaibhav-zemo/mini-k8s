@@ -10,10 +10,16 @@ type Pod struct {
 	RetryCount    int    `json:"retryCount"`
 	DeploymentID  string `json:"deploymentId"`
 	Port          int    `json:"port"`
+	CPU           int    `json:"cpu"`
+	Memory        int    `json:"memory"`
 }
 
 type Node struct {
-	Name string `json:"name"`
+	Name        string `json:"name"`
+	TotalCPU    int    `json:"totalCpu"`
+	UsedCPU     int    `json:"usedCpu"`
+	TotalMemory int    `json:"totalMemory"`
+	UsedMemory  int    `json:"usedMemory"`
 }
 
 type Deployment struct {

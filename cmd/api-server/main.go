@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"mini-k8s/pkg/models"
 	"net/http"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -32,23 +31,37 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	// init nodes
-	clusterState.Nodes["node-1"] = &models.Node{Name: "node-1"}
-	clusterState.Nodes["node-2"] = &models.Node{Name: "node-2"}
+	createNode("node-1", 4, 8192)
+	createNode("node-2", 4, 8192)
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/pods", podsHandler)
 	mux.HandleFunc("/pods/", podHandler)
+
+	mux.HandleFunc("/nodes", nodesHandler)
+	mux.HandleFunc("/nodes/", nodeHandler)
+
 	mux.HandleFunc("/pods-by-node", podsByNodeHandler)
+
 	mux.HandleFunc("/deployments", deploymentsHandler)
 	mux.HandleFunc("/deployments/", deploymentHandler)
+
 	mux.HandleFunc("/services", servicesHandler)
 	mux.HandleFunc("/watch", watchHandler)
 
-	go controllerLoop()
-
 	log.Println("API Server running on :8080")
 	http.ListenAndServe(":8080", mux)
+}
+
+func createNode(name string, cpu int, memory int) {
+	clusterState.Nodes[name] = &models.Node{
+		Name:        name,
+		TotalCPU:    cpu,
+		UsedCPU:     0,
+		TotalMemory: memory,
+		UsedMemory:  0,
+	}
 }
 
 func removeSubscriber(target chan models.Event) {
@@ -145,9 +158,6 @@ func podsHandler(w http.ResponseWriter, r *http.Request) {
 		var pod models.Pod
 		json.NewDecoder(r.Body).Decode(&pod)
 
-		pod.ID = uuid.New().String()
-		pod.Status = "Pending"
-
 		if pod.RestartPolicy == "" {
 			pod.RestartPolicy = "Always"
 		}
@@ -164,6 +174,49 @@ func podsHandler(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodGet:
 		json.NewEncoder(w).Encode(clusterState.Pods)
+	}
+}
+
+func nodesHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(clusterState.Nodes)
+	}
+}
+
+func nodeHandler(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/nodes/")
+
+	node, exists := clusterState.Nodes[name]
+	if !exists {
+		http.Error(w, "Node not found", 404)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPut:
+		var updated models.Node
+		json.NewDecoder(r.Body).Decode(&updated)
+
+		node.UsedCPU = updated.UsedCPU
+		node.UsedMemory = updated.UsedMemory
+
+		broadcast(models.Event{
+			Type: "UPDATED",
+			Kind: "NODE",
+			Data: node,
+		})
+
+	case http.MethodDelete:
+		var deleted models.Node
+		json.NewDecoder(r.Body).Decode(&deleted)
+
+		delete(clusterState.Nodes, name)
+		broadcast(models.Event{
+			Type: "DELETED",
+			Kind: "NODE",
+			Data: deleted,
+		})
 	}
 }
 
@@ -197,6 +250,7 @@ func podHandler(w http.ResponseWriter, r *http.Request) {
 		pod.ContainerID = updated.ContainerID
 		pod.RetryCount = updated.RetryCount
 		pod.Port = updated.Port
+		pod.NodeName = updated.NodeName
 
 		broadcast(models.Event{
 			Type: "UPDATED",
@@ -221,12 +275,21 @@ func podsByNodeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func deploymentsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(clusterState.Deployments)
+	case http.MethodPost:
 		var d models.Deployment
 		json.NewDecoder(r.Body).Decode(&d)
 
 		d.ID = uuid.New().String()
 		clusterState.Deployments[d.ID] = &d
+
+		broadcast(models.Event{
+			Type: "ADDED",
+			Kind: "DEPLOYMENT",
+			Data: d,
+		})
 
 		json.NewEncoder(w).Encode(d)
 	}
@@ -271,159 +334,4 @@ func deploymentHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
-}
-
-// ---------- CONTROLLER ----------
-
-func controllerLoop() {
-	for {
-
-		// -------------------------------
-		// 1. REPLICA CONTROLLER
-		// -------------------------------
-		for _, d := range clusterState.Deployments {
-
-			count := 0
-
-			// count current pods for this deployment
-			for _, pod := range clusterState.Pods {
-				if pod.DeploymentID == d.ID {
-					count++
-				}
-			}
-
-			// SCALE UP
-			if count < d.Replicas {
-				toCreate := d.Replicas - count
-
-				for i := 0; i < toCreate; i++ {
-					pod := &models.Pod{
-						ID:            uuid.New().String(),
-						Image:         d.Image,
-						Status:        "Pending",
-						DeploymentID:  d.ID,
-						RestartPolicy: "Always",
-					}
-
-					clusterState.Pods[pod.ID] = pod
-					broadcast(models.Event{
-						Type: "ADDED",
-						Kind: "POD",
-						Data: pod,
-					})
-					log.Printf("[ReplicaController] Created pod %s for deployment %s\n", pod.ID, d.ID)
-				}
-			}
-
-			// SCALE DOWN
-			if count > d.Replicas {
-				toDelete := count - d.Replicas
-
-				for id, pod := range clusterState.Pods {
-					if pod.DeploymentID == d.ID && toDelete > 0 {
-
-						if pod.ContainerID != "" {
-							err := stopAndRemoveContainer(pod.ContainerID)
-							if err != nil {
-								log.Printf("Failed to cleanup container for pod %s\n", id)
-							}
-						}
-
-						delete(clusterState.Pods, id)
-						toDelete--
-
-						broadcast(models.Event{
-							Type: "DELETED",
-							Kind: "POD",
-							Data: pod,
-						})
-						log.Printf("[ReplicaController] Deleted pod %s\n", id)
-					}
-				}
-			}
-		}
-
-		// -------------------------------
-		// 2. SCHEDULER (Pending → Scheduled)
-		// -------------------------------
-		for _, pod := range clusterState.Pods {
-
-			if pod.Status == "Pending" {
-
-				node := schedulePod()
-				if node == "" {
-					continue
-				}
-
-				pod.NodeName = node
-				pod.Status = "Scheduled"
-
-				log.Printf("[Scheduler] Pod %s scheduled on %s\n", pod.ID, node)
-			}
-		}
-
-		// -------------------------------
-		// 3. FAILURE HANDLING (Retry logic)
-		// -------------------------------
-		for _, pod := range clusterState.Pods {
-
-			if pod.Status == "Failed" {
-
-				switch pod.RestartPolicy {
-
-				case "Always":
-					log.Printf("[Controller] Retrying pod %s (Always)", pod.ID)
-					pod.Status = "Scheduled"
-
-				case "OnFailure":
-					if pod.RetryCount < 3 {
-						log.Printf("[Controller] Retrying pod %s (OnFailure)", pod.ID)
-						pod.Status = "Scheduled"
-					} else {
-						log.Printf("[Controller] Pod %s exceeded retry limit", pod.ID)
-					}
-
-				case "Never":
-					log.Printf("[Controller] Pod %s will not restart", pod.ID)
-				}
-			}
-		}
-
-		// -------------------------------
-		// LOOP INTERVAL
-		// -------------------------------
-		time.Sleep(2 * time.Second)
-	}
-}
-
-func stopAndRemoveContainer(containerID string) error {
-	if containerID == "" {
-		return nil
-	}
-
-	// Stop container
-	stopCmd := exec.Command("docker", "stop", containerID)
-	stopOut, err := stopCmd.CombinedOutput()
-	if err != nil {
-		log.Printf("Error stopping container %s: %s\n", containerID, string(stopOut))
-		return err
-	}
-
-	// Remove container (important to avoid clutter)
-	rmCmd := exec.Command("docker", "rm", containerID)
-	rmOut, err := rmCmd.CombinedOutput()
-	if err != nil {
-		log.Printf("Error removing container %s: %s\n", containerID, string(rmOut))
-		return err
-	}
-
-	log.Printf("Container %s stopped and removed\n", containerID)
-	return nil
-}
-
-func schedulePod() string {
-	for _, node := range clusterState.Nodes {
-		return node.Name
-	}
-	return ""
 }

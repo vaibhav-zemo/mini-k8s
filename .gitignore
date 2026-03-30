@@ -11,3 +11,6 @@ bin/
 
 # logs
 *.log
+
+# db
+*.db

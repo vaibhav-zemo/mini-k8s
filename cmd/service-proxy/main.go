@@ -4,13 +4,14 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
 	"mini-k8s/pkg/clients"
 	"mini-k8s/pkg/models"
 	"mini-k8s/pkg/utils"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -60,7 +61,7 @@ func handleEvent(event models.Event) {
 		if event.Type == "DELETED" {
 			delete(serviceCache, svc.ID)
 		} else {
-			serviceCache[svc.ID] = svc
+			serviceCache[svc.Name] = svc
 		}
 	}
 }
@@ -101,7 +102,7 @@ func initialSync() {
 	// services
 	services := clients.GetServices()
 	for _, s := range services {
-		serviceCache[s.ID] = s
+		serviceCache[s.Name] = s
 	}
 
 	log.Println("Initial sync done")
@@ -133,21 +134,45 @@ func pickPod(pods []*models.Pod) *models.Pod {
 	return pods[rand.Intn(len(pods))]
 }
 
-func proxyToPod(w http.ResponseWriter, r *http.Request, pod *models.Pod) {
-
-	url := fmt.Sprintf("http://localhost:%d", pod.Port)
-
-	resp, err := http.Get(url)
-	if err != nil {
-		http.Error(w, "Pod unreachable", 500)
-		return
+func pickPodRR(service *models.Service, pods []*models.Pod) *models.Pod {
+	if len(pods) == 0 {
+		return nil
 	}
-	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	pod := pods[service.Index%len(pods)]
+	service.Index = (service.Index + 1) % len(pods)
 
-	w.WriteHeader(resp.StatusCode)
-	w.Write(body)
+	return pod
+}
+
+func proxyToPod(w http.ResponseWriter, r *http.Request, pod *models.Pod) {
+	target, _ := url.Parse(fmt.Sprintf("http://localhost:%d", pod.Port))
+
+	// preserve original request path
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+
+			// set target (like Director used to do)
+			pr.SetURL(target)
+
+			// 🔥 FIX: strip "/service/{name}"
+			parts := strings.SplitN(pr.In.URL.Path, "/", 4)
+			if len(parts) >= 4 {
+				pr.Out.URL.Path = "/" + parts[3]
+			} else {
+				pr.Out.URL.Path = "/"
+			}
+
+			// preserve query params
+			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+		},
+	}
+
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		http.Error(w, "Pod unreachable", 502)
+	}
+
+	proxy.ServeHTTP(w, r)
 }
 
 func serviceProxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -167,7 +192,8 @@ func serviceProxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pod := pickPod(runningPods)
+	//pod := pickPod(runningPods)
+	pod := pickPodRR(service, runningPods)
 
 	proxyToPod(w, r, pod)
 }

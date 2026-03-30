@@ -4,11 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"mini-k8s/pkg/models"
+	"mini-k8s/pkg/store"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -26,13 +25,10 @@ var clusterState = struct {
 }
 
 var subscribers = make([]chan models.Event, 0)
+var storeInstance = store.NewBoltStore("cluster.db")
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
-	// init nodes
-	createNode("node-1", 4, 8192)
-	createNode("node-2", 4, 8192)
+	initialSync()
 
 	mux := http.NewServeMux()
 
@@ -54,6 +50,33 @@ func main() {
 	http.ListenAndServe(":8080", mux)
 }
 
+func initialSync() {
+	// init nodes
+	createNode("node-1", 4, 8192)
+	createNode("node-2", 4, 8192)
+
+	// fetch pods
+	pods, _ := storeInstance.GetPods()
+	for _, p := range pods {
+		clusterState.Pods[p.ID] = p
+	}
+
+	nodes, _ := storeInstance.GetNodes()
+	for _, n := range nodes {
+		clusterState.Nodes[n.Name] = n
+	}
+
+	deployments, _ := storeInstance.GetDeployments()
+	for _, d := range deployments {
+		clusterState.Deployments[d.ID] = d
+	}
+
+	services, _ := storeInstance.GetServices()
+	for _, s := range services {
+		clusterState.Services[s.ID] = s
+	}
+}
+
 func createNode(name string, cpu int, memory int) {
 	clusterState.Nodes[name] = &models.Node{
 		Name:        name,
@@ -62,6 +85,7 @@ func createNode(name string, cpu int, memory int) {
 		TotalMemory: memory,
 		UsedMemory:  0,
 	}
+	storeInstance.SaveNode(clusterState.Nodes[name])
 }
 
 func removeSubscriber(target chan models.Event) {
@@ -132,6 +156,7 @@ func servicesHandler(w http.ResponseWriter, r *http.Request) {
 
 		s.ID = uuid.New().String()
 		clusterState.Services[s.ID] = &s
+		storeInstance.SaveService(&s)
 
 		log.Printf("[API] Service created: %s\n", s.Name)
 
@@ -163,6 +188,7 @@ func podsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		clusterState.Pods[pod.ID] = &pod
+		storeInstance.SavePod(&pod) // persist in boltDb
 
 		broadcast(models.Event{
 			Type: "ADDED",
@@ -200,6 +226,7 @@ func nodeHandler(w http.ResponseWriter, r *http.Request) {
 
 		node.UsedCPU = updated.UsedCPU
 		node.UsedMemory = updated.UsedMemory
+		storeInstance.SaveNode(node)
 
 		broadcast(models.Event{
 			Type: "UPDATED",
@@ -252,6 +279,8 @@ func podHandler(w http.ResponseWriter, r *http.Request) {
 		pod.Port = updated.Port
 		pod.NodeName = updated.NodeName
 
+		storeInstance.SavePod(pod)
+
 		broadcast(models.Event{
 			Type: "UPDATED",
 			Kind: "POD",
@@ -284,6 +313,7 @@ func deploymentsHandler(w http.ResponseWriter, r *http.Request) {
 
 		d.ID = uuid.New().String()
 		clusterState.Deployments[d.ID] = &d
+		storeInstance.SaveDeployment(&d)
 
 		broadcast(models.Event{
 			Type: "ADDED",
@@ -324,6 +354,14 @@ func deploymentHandler(w http.ResponseWriter, r *http.Request) {
 
 			d.Replicas = updated.Replicas
 		}
+
+		storeInstance.SaveDeployment(d)
+
+		broadcast(models.Event{
+			Type: "UPDATED",
+			Kind: "DEPLOYMENT",
+			Data: d,
+		})
 
 		json.NewEncoder(w).Encode(d)
 

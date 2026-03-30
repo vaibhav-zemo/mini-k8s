@@ -33,6 +33,7 @@ type Service struct {
 	Name         string `json:"name"`
 	DeploymentID string `json:"deploymentId"`
 	Port         int    `json:"port"`
+	Index        int    `json:"-"`
 }
 
 type Event struct {
